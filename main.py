@@ -453,3 +453,94 @@ class Store:
     def lane_list(self, *, enabled_only: bool = False) -> list[dict]:
         q = "SELECT * FROM lanes"
         params: tuple[t.Any, ...] = ()
+        if enabled_only:
+            q += " WHERE enabled=1"
+        q += " ORDER BY updated_at_s DESC"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def quote_put(self, q: dict) -> None:
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT INTO quotes(quote_id,buyer,lane_id,cover_wei,start_at_s,end_at_s,created_at_s,expires_at_s,salt,consumed)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    q["quote_id"],
+                    q["buyer"],
+                    q["lane_id"],
+                    int(q["cover_wei"]),
+                    int(q["start_at_s"]),
+                    int(q["end_at_s"]),
+                    int(q["created_at_s"]),
+                    int(q["expires_at_s"]),
+                    int(q["salt"]),
+                    1 if q.get("consumed") else 0,
+                ),
+            )
+
+    def quote_get(self, quote_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM quotes WHERE quote_id=?", (quote_id,)).fetchone()
+        if not row:
+            raise NotFound("quote not found", details={"quote_id": quote_id})
+        return row
+
+    def quote_mark_consumed(self, quote_id: str) -> None:
+        with self.tx() as db:
+            row = db.execute("SELECT consumed FROM quotes WHERE quote_id=?", (quote_id,)).fetchone()
+            if not row:
+                raise NotFound("quote not found", details={"quote_id": quote_id})
+            if int(row["consumed"]) == 1:
+                raise Conflict("quote already consumed")
+            db.execute("UPDATE quotes SET consumed=1 WHERE quote_id=?", (quote_id,))
+
+    def policy_put(self, p: dict) -> None:
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT INTO policies(policy_id,quote_id,holder,lane_id,cover_wei,premium_wei,fee_wei,start_at_s,end_at_s,bound_at_s,state,nonce)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    p["policy_id"],
+                    p["quote_id"],
+                    p["holder"],
+                    p["lane_id"],
+                    int(p["cover_wei"]),
+                    int(p["premium_wei"]),
+                    int(p["fee_wei"]),
+                    int(p["start_at_s"]),
+                    int(p["end_at_s"]),
+                    int(p["bound_at_s"]),
+                    p["state"],
+                    int(p["nonce"]),
+                ),
+            )
+
+    def policy_get(self, policy_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM policies WHERE policy_id=?", (policy_id,)).fetchone()
+        if not row:
+            raise NotFound("policy not found", details={"policy_id": policy_id})
+        return row
+
+    def policy_update_state(self, policy_id: str, state: str, *, bump_nonce: bool = True) -> None:
+        with self.tx() as db:
+            row = db.execute("SELECT nonce FROM policies WHERE policy_id=?", (policy_id,)).fetchone()
+            if not row:
+                raise NotFound("policy not found", details={"policy_id": policy_id})
+            nonce = int(row["nonce"]) + (1 if bump_nonce else 0)
+            db.execute("UPDATE policies SET state=?, nonce=? WHERE policy_id=?", (state, nonce, policy_id))
+
+    def claim_put(self, c: dict) -> None:
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT INTO claims(claim_id,policy_id,holder,loss_ref,filed_at_s,state,payout_wei,verdict_hash,attested_at_s,paid_at_s,void_reason)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    c["claim_id"],
+                    c["policy_id"],
+                    c["holder"],
+                    c["loss_ref"],
