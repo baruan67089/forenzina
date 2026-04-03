@@ -817,3 +817,94 @@ class Engine:
             "meta": {
                 "created_at": self._m_str("created_at"),
                 "genesis_tag": self._m_str("genesis_tag"),
+                "quote_ttl_s": self._m_int("quote_ttl_s"),
+                "withdraw_delay_s": self._m_int("withdraw_delay_s"),
+            },
+            "pool": {
+                "available_capital_wei": self._m_int("available_capital_wei"),
+                "reserved_capital_wei": self._m_int("reserved_capital_wei"),
+                "total_premiums_wei": self._m_int("total_premiums_wei"),
+                "total_claims_paid_wei": self._m_int("total_claims_paid_wei"),
+                "protocol_fee_bps": self._m_int("protocol_fee_bps"),
+                "reserve_factor_bps": self._m_int("reserve_factor_bps"),
+                "max_slippage_bps": self._m_int("max_slippage_bps"),
+                "treasury": self._m_str("treasury"),
+                "oracle": self._m_str("oracle"),
+            },
+            "sentinels": list(INERT_SENTINELS),
+            "onchain_pairing": {
+                "contract": "apex",
+                "forenzina_integration": "solidity constant FORENZINA_INTEGRATION_TAG = keccak256(\"forenzina.apex.integration.v1\")",
+            },
+            "time": {"utc_now_s": utc_now_s(), "iso": iso_utc()},
+        }
+
+    def pool_deposit(self, amount_wei: int, *, memo: str) -> dict:
+        if amount_wei <= 0:
+            raise BadInput("amount must be > 0")
+        avail = self._m_int("available_capital_wei")
+        avail = safe_add_u256(avail, int(amount_wei), what="available+deposit")
+        self.s.meta_set("available_capital_wei", str(avail))
+        entry_id = self.s.ledger_add(kind="deposit", ref="pool", amount_wei=int(amount_wei), memo=memo or "deposit")
+        return {"entry_id": entry_id, "available_capital_wei": avail}
+
+    def lane_configure(self, lane_id: str, *, enabled: bool, capacity_wad: int, min_premium_wad: int, max_duration_s: int, deductible_bps: int, grace_bps: int) -> dict:
+        ensure_hex(lane_id, what="lane_id")
+        capacity_wad = clamp_int(int(capacity_wad), 1, 2_000_000_000, what="capacity_wad")
+        min_premium_wad = clamp_int(int(min_premium_wad), 1, 8_000_000_000, what="min_premium_wad")
+        max_duration_s = clamp_int(int(max_duration_s), 5 * 60, 365 * 24 * 60 * 60, what="max_duration_s")
+        deductible_bps = clamp_int(int(deductible_bps), 0, 6_600, what="deductible_bps")
+        grace_bps = clamp_int(int(grace_bps), 0, 2_500, what="grace_bps")
+
+        self.s.lane_upsert(
+            lane_id,
+            enabled=bool(enabled),
+            capacity_wad=capacity_wad,
+            min_premium_wad=min_premium_wad,
+            max_duration_s=max_duration_s,
+            deductible_bps=deductible_bps,
+            grace_bps=grace_bps,
+        )
+        return {"ok": True, "lane": dict(self.s.lane_get(lane_id))}
+
+    def quote_open(self, *, buyer: str, lane_id: str, cover_wei: int, start_at_s: int, end_at_s: int, salt: int | None = None) -> dict:
+        ensure_hex(buyer, what="buyer")
+        ensure_hex(lane_id, what="lane_id")
+        cover_wei = clamp_int(int(cover_wei), 1, 10**40, what="cover_wei")
+        start_at_s = clamp_int(int(start_at_s), 0, 2_000_000_000, what="start_at_s")
+        end_at_s = clamp_int(int(end_at_s), 0, 2_000_000_000, what="end_at_s")
+        if end_at_s <= start_at_s:
+            raise BadInput("end_at_s must be > start_at_s")
+
+        now_s = utc_now_s()
+        if start_at_s < now_s:
+            raise TooLate("start time in the past", details={"now_s": now_s, "start_at_s": start_at_s})
+
+        lane = self.s.lane_get(lane_id)
+        if int(lane["enabled"]) != 1:
+            raise NotFound("lane disabled", details={"lane_id": lane_id})
+        term = end_at_s - start_at_s
+        if term > int(lane["max_duration_s"]):
+            raise BadInput("term too long", details={"term_s": term, "max_duration_s": int(lane["max_duration_s"])})
+
+        if salt is None:
+            salt = secrets.randbelow(2**96 - 1) + 1
+        salt = clamp_int(int(salt), 1, 2**96 - 1, what="salt")
+
+        quote_id = quote_id_for(buyer, lane_id, cover_wei, start_at_s, end_at_s, salt)
+        # if already exists => conflict
+        with contextlib.suppress(NotFound):
+            _ = self.s.quote_get(quote_id)
+            raise Conflict("quote already exists", details={"quote_id": quote_id})
+
+        ttl = self._m_int("quote_ttl_s")
+        created_at = now_s
+        expires_at = now_s + ttl
+
+        premium_wei, reserve_wei = price_quote(
+            cover_wei,
+            start_at_s,
+            end_at_s,
+            min_premium_wad=int(lane["min_premium_wad"]),
+            reserve_factor_bps=self._m_int("reserve_factor_bps"),
+        )
