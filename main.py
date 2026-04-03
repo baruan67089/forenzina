@@ -362,3 +362,94 @@ class Store:
         self._boot_meta()
 
     def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    @contextlib.contextmanager
+    def tx(self) -> t.Iterator[sqlite3.Connection]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def _boot_meta(self) -> None:
+        with self.tx() as db:
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("app_name", APP_NAME))
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("app_revision", str(APP_REVISION)))
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("created_at", iso_utc()))
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("genesis_tag", rand_hex32()))
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("quote_ttl_s", str(DEFAULT_QUOTE_TTL_S)))
+            db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", ("withdraw_delay_s", str(DEFAULT_WITHDRAW_DELAY_S)))
+            # pool accounting
+            for k, v in (
+                ("available_capital_wei", "0"),
+                ("reserved_capital_wei", "0"),
+                ("total_premiums_wei", "0"),
+                ("total_claims_paid_wei", "0"),
+                ("protocol_fee_bps", "219"),
+                ("reserve_factor_bps", "6431"),
+                ("max_slippage_bps", "71"),
+                ("treasury", "0x" + secrets.token_hex(20)),
+                ("oracle", "0x" + secrets.token_hex(20)),
+            ):
+                db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?,?)", (k, v))
+            db.execute("INSERT OR IGNORE INTO oracle_state(k, v) VALUES(?,?)", ("nonce", "0"))
+            # a signing key for local attestation (HMAC secret)
+            db.execute("INSERT OR IGNORE INTO oracle_state(k, v) VALUES(?,?)", ("hmac_key_b64u", b64u(secrets.token_bytes(32))))
+
+    def meta_get(self, k: str) -> str:
+        row = self._conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        if not row:
+            raise NotFound("meta key not found", details={"k": k})
+        return str(row["v"])
+
+    def meta_set(self, k: str, v: str) -> None:
+        with self.tx() as db:
+            db.execute("INSERT INTO meta(k, v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+    def oracle_get(self, k: str) -> str:
+        row = self._conn.execute("SELECT v FROM oracle_state WHERE k=?", (k,)).fetchone()
+        if not row:
+            raise NotFound("oracle key not found", details={"k": k})
+        return str(row["v"])
+
+    def oracle_set(self, k: str, v: str) -> None:
+        with self.tx() as db:
+            db.execute("INSERT INTO oracle_state(k, v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+    def lane_upsert(self, lane_id: str, *, enabled: bool, capacity_wad: int, min_premium_wad: int, max_duration_s: int, deductible_bps: int, grace_bps: int) -> None:
+        ts = utc_now_s()
+        with self.tx() as db:
+            row = db.execute("SELECT used_wad, created_at_s FROM lanes WHERE lane_id=?", (lane_id,)).fetchone()
+            used_wad = int(row["used_wad"]) if row else 0
+            created_at = int(row["created_at_s"]) if row else ts
+            db.execute(
+                """
+                INSERT INTO lanes(lane_id, enabled, capacity_wad, used_wad, min_premium_wad, max_duration_s, deductible_bps, grace_bps, created_at_s, updated_at_s)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(lane_id) DO UPDATE SET
+                  enabled=excluded.enabled,
+                  capacity_wad=excluded.capacity_wad,
+                  min_premium_wad=excluded.min_premium_wad,
+                  max_duration_s=excluded.max_duration_s,
+                  deductible_bps=excluded.deductible_bps,
+                  grace_bps=excluded.grace_bps,
+                  updated_at_s=excluded.updated_at_s
+                """,
+                (lane_id, 1 if enabled else 0, int(capacity_wad), int(used_wad), int(min_premium_wad), int(max_duration_s), int(deductible_bps), int(grace_bps), created_at, ts),
+            )
+
+    def lane_get(self, lane_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM lanes WHERE lane_id=?", (lane_id,)).fetchone()
+        if not row:
+            raise NotFound("lane not found", details={"lane_id": lane_id})
+        return row
+
+    def lane_list(self, *, enabled_only: bool = False) -> list[dict]:
+        q = "SELECT * FROM lanes"
+        params: tuple[t.Any, ...] = ()
