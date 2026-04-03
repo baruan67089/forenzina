@@ -89,3 +89,94 @@ class ForenzinaError(Exception):
 class BadInput(ForenzinaError):
     code = "bad_input"
 
+
+class NotFound(ForenzinaError):
+    code = "not_found"
+
+
+class Conflict(ForenzinaError):
+    code = "conflict"
+
+
+class Unauthorized(ForenzinaError):
+    code = "unauthorized"
+
+
+class TooLate(ForenzinaError):
+    code = "too_late"
+
+
+class TooSoon(ForenzinaError):
+    code = "too_soon"
+
+
+class Accounting(ForenzinaError):
+    code = "accounting"
+
+
+# -----------------------------
+# Small helpers (time, json)
+# -----------------------------
+
+def utc_now_s() -> int:
+    return int(time.time())
+
+
+def iso_utc(ts: int | float | None = None) -> str:
+    if ts is None:
+        ts = time.time()
+    return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat()
+
+
+def clamp_int(x: int, lo: int, hi: int, *, what: str) -> int:
+    if not isinstance(x, int):
+        raise BadInput(f"{what} must be int")
+    if x < lo or x > hi:
+        raise BadInput(f"{what} out of range", details={"lo": lo, "hi": hi, "got": x})
+    return x
+
+
+def ensure_hex(s: str, *, what: str) -> str:
+    if not isinstance(s, str):
+        raise BadInput(f"{what} must be string")
+    if not s.startswith("0x"):
+        raise BadInput(f"{what} must start with 0x")
+    h = s[2:]
+    if len(h) == 0 or len(h) % 2 != 0:
+        raise BadInput(f"{what} invalid hex length")
+    try:
+        int(h, 16)
+    except Exception as e:
+        raise BadInput(f"{what} invalid hex") from e
+    return s
+
+
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def b64u_decode(s: str) -> bytes:
+    if not isinstance(s, str):
+        raise BadInput("b64u must be string")
+    pad = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
+
+def stable_json(obj: t.Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def json_loads_limited(raw: bytes) -> t.Any:
+    if len(raw) > MAX_BODY_BYTES:
+        raise BadInput("body too large")
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise BadInput("invalid json") from e
+    _depth_guard(obj, 0)
+    return obj
+
+
+def _depth_guard(obj: t.Any, depth: int) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise BadInput("json too deep")
