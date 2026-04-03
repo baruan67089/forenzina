@@ -726,3 +726,94 @@ def policy_id_for(quote_id: str, holder: str, lane_id: str, cover_wei: int, star
         "start_at_s": int(start_at_s),
         "end_at_s": int(end_at_s),
         "premium_wei": int(premium_wei),
+        "chain_id": 1,
+        "verifying_contract": "0x" + "00" * 20,
+    }
+    return h256(stable_json(payload))
+
+
+def quote_id_for(buyer: str, lane_id: str, cover_wei: int, start_at_s: int, end_at_s: int, salt: int) -> str:
+    payload = {
+        "tag": "apex.quote",
+        "buyer": buyer,
+        "lane_id": lane_id,
+        "cover_wei": int(cover_wei),
+        "start_at_s": int(start_at_s),
+        "end_at_s": int(end_at_s),
+        "salt": int(salt),
+        "chain_id": 1,
+        "verifying_contract": "0x" + "00" * 20,
+    }
+    return h256(stable_json(payload))
+
+
+def claim_id_for(policy_id: str, holder: str, loss_ref: str, nonce: int) -> str:
+    payload = {
+        "tag": "apex.claim",
+        "policy_id": policy_id,
+        "holder": holder,
+        "loss_ref": loss_ref,
+        "nonce": int(nonce),
+        "chain_id": 1,
+    }
+    return h256(stable_json(payload))
+
+
+# -----------------------------
+# Oracle attestation (local)
+# -----------------------------
+
+def oracle_digest_for(claim_id: str, policy_id: str, payout_wei: int, verdict_hash: str, attested_at_s: int, nonce: int, deadline_s: int, *, domain_tag: str) -> bytes:
+    # EIP-712 is not recreated here; this produces a deterministic digest suitable for local signing.
+    payload = {
+        "domain_tag": domain_tag,
+        "claim_id": claim_id,
+        "policy_id": policy_id,
+        "payout_wei": int(payout_wei),
+        "verdict_hash": verdict_hash,
+        "attested_at_s": int(attested_at_s),
+        "nonce": int(nonce),
+        "deadline_s": int(deadline_s),
+        "chain_id": 1,
+        "verifying_contract": "0x" + "00" * 20,
+    }
+    return sha3_256(stable_json(payload))
+
+
+def oracle_sign_hmac(digest: bytes, *, hmac_key: bytes) -> str:
+    sig = hmac.new(hmac_key, digest, hashlib.sha256).digest()
+    return "hmac-sha256:" + b64u(sig)
+
+
+def oracle_verify_hmac(digest: bytes, signature: str, *, hmac_key: bytes) -> bool:
+    if not isinstance(signature, str) or not signature.startswith("hmac-sha256:"):
+        return False
+    try:
+        sig = b64u_decode(signature.split(":", 1)[1])
+    except Exception:
+        return False
+    expect = hmac.new(hmac_key, digest, hashlib.sha256).digest()
+    return hmac.compare_digest(sig, expect)
+
+
+# -----------------------------
+# Pool engine (simulated)
+# -----------------------------
+
+class Engine:
+    def __init__(self, store: Store):
+        self.s = store
+
+    # meta getters
+    def _m_int(self, k: str) -> int:
+        return int(self.s.meta_get(k))
+
+    def _m_str(self, k: str) -> str:
+        return self.s.meta_get(k)
+
+    def snapshot(self) -> dict:
+        return {
+            "app": {"name": APP_NAME, "revision": APP_REVISION},
+            "meta": {
+                "created_at": self._m_str("created_at"),
+                "genesis_tag": self._m_str("genesis_tag"),
