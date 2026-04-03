@@ -271,3 +271,94 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 
 CREATE TABLE IF NOT EXISTS lanes(
+  lane_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL,
+  capacity_wad INTEGER NOT NULL,
+  used_wad INTEGER NOT NULL,
+  min_premium_wad INTEGER NOT NULL,
+  max_duration_s INTEGER NOT NULL,
+  deductible_bps INTEGER NOT NULL,
+  grace_bps INTEGER NOT NULL,
+  created_at_s INTEGER NOT NULL,
+  updated_at_s INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quotes(
+  quote_id TEXT PRIMARY KEY,
+  buyer TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  cover_wei INTEGER NOT NULL,
+  start_at_s INTEGER NOT NULL,
+  end_at_s INTEGER NOT NULL,
+  created_at_s INTEGER NOT NULL,
+  expires_at_s INTEGER NOT NULL,
+  salt INTEGER NOT NULL,
+  consumed INTEGER NOT NULL,
+  FOREIGN KEY(lane_id) REFERENCES lanes(lane_id)
+);
+
+CREATE TABLE IF NOT EXISTS policies(
+  policy_id TEXT PRIMARY KEY,
+  quote_id TEXT NOT NULL,
+  holder TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  cover_wei INTEGER NOT NULL,
+  premium_wei INTEGER NOT NULL,
+  fee_wei INTEGER NOT NULL,
+  start_at_s INTEGER NOT NULL,
+  end_at_s INTEGER NOT NULL,
+  bound_at_s INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  nonce INTEGER NOT NULL,
+  FOREIGN KEY(quote_id) REFERENCES quotes(quote_id),
+  FOREIGN KEY(lane_id) REFERENCES lanes(lane_id)
+);
+
+CREATE TABLE IF NOT EXISTS claims(
+  claim_id TEXT PRIMARY KEY,
+  policy_id TEXT NOT NULL,
+  holder TEXT NOT NULL,
+  loss_ref TEXT NOT NULL,
+  filed_at_s INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  payout_wei INTEGER NOT NULL,
+  verdict_hash TEXT NOT NULL,
+  attested_at_s INTEGER NOT NULL,
+  paid_at_s INTEGER NOT NULL,
+  void_reason TEXT NOT NULL,
+  FOREIGN KEY(policy_id) REFERENCES policies(policy_id)
+);
+
+CREATE TABLE IF NOT EXISTS ledger(
+  entry_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  at_s INTEGER NOT NULL,
+  ref TEXT NOT NULL,
+  amount_wei INTEGER NOT NULL,
+  memo TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS credits(
+  who TEXT PRIMARY KEY,
+  amount_wei INTEGER NOT NULL,
+  updated_at_s INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oracle_state(
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+"""
+
+
+class Store:
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        with self._conn:
+            self._conn.executescript(SCHEMA_SQL)
+        self._boot_meta()
+
+    def close(self) -> None:
