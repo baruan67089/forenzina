@@ -635,3 +635,94 @@ class LaneCfg:
     capacity_wad: int
     min_premium_wad: int
     max_duration_s: int
+    deductible_bps: int
+    grace_bps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Quote:
+    quote_id: str
+    buyer: str
+    lane_id: str
+    cover_wei: int
+    start_at_s: int
+    end_at_s: int
+    created_at_s: int
+    expires_at_s: int
+    salt: int
+    consumed: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class Policy:
+    policy_id: str
+    quote_id: str
+    holder: str
+    lane_id: str
+    cover_wei: int
+    premium_wei: int
+    fee_wei: int
+    start_at_s: int
+    end_at_s: int
+    bound_at_s: int
+    state: str
+    nonce: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Claim:
+    claim_id: str
+    policy_id: str
+    holder: str
+    loss_ref: str
+    filed_at_s: int
+    state: str
+    payout_wei: int
+    verdict_hash: str
+    attested_at_s: int
+    paid_at_s: int
+    void_reason: str
+
+
+def cover_to_wad(cover_wei: int) -> int:
+    # 1 ETH => 1e4 (coverWei/1e14)
+    if cover_wei <= 0:
+        raise BadInput("cover must be > 0")
+    wad = cover_wei // 10**14
+    if wad == 0:
+        wad = 1
+    if wad > 2**32 - 1:
+        raise BadInput("cover too large")
+    return int(wad)
+
+
+def grace_seconds(grace_bps: int, term_s: int) -> int:
+    if grace_bps <= 0:
+        return 0
+    if term_s <= 0:
+        return 0
+    return int((int(term_s) * int(grace_bps)) // BPS)
+
+
+def price_quote(cover_wei: int, start_at_s: int, end_at_s: int, *, min_premium_wad: int, reserve_factor_bps: int) -> tuple[int, int]:
+    term_s = int(end_at_s) - int(start_at_s)
+    if term_s <= 0:
+        raise BadInput("invalid term")
+    base = (int(cover_wei) * int(min_premium_wad)) // 10_000
+    premium = (base * term_s) // YEAR_SECONDS
+    if premium <= 0:
+        premium = 1
+    reserve = (int(cover_wei) * int(reserve_factor_bps)) // BPS
+    return int(premium), int(reserve)
+
+
+def policy_id_for(quote_id: str, holder: str, lane_id: str, cover_wei: int, start_at_s: int, end_at_s: int, premium_wei: int) -> str:
+    payload = {
+        "tag": "apex.policy",
+        "quote_id": quote_id,
+        "holder": holder,
+        "lane_id": lane_id,
+        "cover_wei": int(cover_wei),
+        "start_at_s": int(start_at_s),
+        "end_at_s": int(end_at_s),
+        "premium_wei": int(premium_wei),
