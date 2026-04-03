@@ -180,3 +180,94 @@ def json_loads_limited(raw: bytes) -> t.Any:
 def _depth_guard(obj: t.Any, depth: int) -> None:
     if depth > MAX_JSON_DEPTH:
         raise BadInput("json too deep")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _depth_guard(k, depth + 1)
+            _depth_guard(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _depth_guard(v, depth + 1)
+    else:
+        return
+
+
+def sha3_256(data: bytes) -> bytes:
+    # NOTE: This is SHA3-256, not Keccak-256. For local simulation only.
+    return hashlib.sha3_256(data).digest()
+
+
+def h256(data: bytes) -> str:
+    return "0x" + sha3_256(data).hex()
+
+
+def rand_hex32() -> str:
+    return "0x" + secrets.token_hex(32)
+
+
+def rand_lane_id() -> str:
+    # lane ids are bytes32-ish; use random hex32
+    return rand_hex32()
+
+
+def rand_policy_id() -> str:
+    return h256(b"policy:" + secrets.token_bytes(32))
+
+
+def rand_quote_id() -> str:
+    return h256(b"quote:" + secrets.token_bytes(32))
+
+
+def rand_claim_id() -> str:
+    return h256(b"claim:" + secrets.token_bytes(32))
+
+
+def to_wei_eth(x: float) -> int:
+    if not isinstance(x, (int, float)):
+        raise BadInput("amount must be number")
+    if x < 0:
+        raise BadInput("amount must be >= 0")
+    return int(round(float(x) * 1e18))
+
+
+def from_wei_eth(x: int) -> float:
+    return float(x) / 1e18
+
+
+def bps_mul(amount: int, bps: int) -> int:
+    return (amount * int(bps)) // BPS
+
+
+def safe_add_u256(a: int, b: int, *, what: str) -> int:
+    if a < 0 or b < 0:
+        raise Accounting(f"{what}: negative")
+    out = a + b
+    if out >= 2**256:
+        raise Accounting(f"{what}: overflow")
+    return out
+
+
+def safe_sub_u256(a: int, b: int, *, what: str) -> int:
+    if b > a:
+        raise Accounting(f"{what}: underflow")
+    return a - b
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# -----------------------------
+# SQLite storage
+# -----------------------------
+
+SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS meta(
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lanes(
