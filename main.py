@@ -544,3 +544,94 @@ class Store:
                     c["policy_id"],
                     c["holder"],
                     c["loss_ref"],
+                    int(c["filed_at_s"]),
+                    c["state"],
+                    int(c["payout_wei"]),
+                    c["verdict_hash"],
+                    int(c["attested_at_s"]),
+                    int(c["paid_at_s"]),
+                    c["void_reason"],
+                ),
+            )
+
+    def claim_get(self, claim_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+        if not row:
+            raise NotFound("claim not found", details={"claim_id": claim_id})
+        return row
+
+    def claim_update(self, claim_id: str, *, state: str | None = None, payout_wei: int | None = None, verdict_hash: str | None = None, attested_at_s: int | None = None, paid_at_s: int | None = None, void_reason: str | None = None) -> None:
+        fields: list[str] = []
+        vals: list[t.Any] = []
+        for k, v in (
+            ("state", state),
+            ("payout_wei", payout_wei),
+            ("verdict_hash", verdict_hash),
+            ("attested_at_s", attested_at_s),
+            ("paid_at_s", paid_at_s),
+            ("void_reason", void_reason),
+        ):
+            if v is None:
+                continue
+            fields.append(f"{k}=?")
+            vals.append(v)
+        if not fields:
+            return
+        vals.append(claim_id)
+        with self.tx() as db:
+            db.execute(f"UPDATE claims SET {', '.join(fields)} WHERE claim_id=?", tuple(vals))
+
+    def ledger_add(self, *, kind: str, ref: str, amount_wei: int, memo: str) -> str:
+        entry_id = str(uuid.uuid4())
+        with self.tx() as db:
+            db.execute(
+                "INSERT INTO ledger(entry_id,kind,at_s,ref,amount_wei,memo) VALUES(?,?,?,?,?,?)",
+                (entry_id, kind, utc_now_s(), ref, int(amount_wei), memo),
+            )
+        return entry_id
+
+    def ledger_recent(self, limit: int = 100) -> list[dict]:
+        limit = clamp_int(int(limit), 1, 1000, what="limit")
+        rows = self._conn.execute("SELECT * FROM ledger ORDER BY at_s DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def credit_get(self, who: str) -> int:
+        row = self._conn.execute("SELECT amount_wei FROM credits WHERE who=?", (who,)).fetchone()
+        if not row:
+            return 0
+        return int(row["amount_wei"])
+
+    def credit_add(self, who: str, delta_wei: int) -> None:
+        ts = utc_now_s()
+        with self.tx() as db:
+            row = db.execute("SELECT amount_wei FROM credits WHERE who=?", (who,)).fetchone()
+            cur = int(row["amount_wei"]) if row else 0
+            nxt = safe_add_u256(cur, int(delta_wei), what="credit_add")
+            db.execute(
+                "INSERT INTO credits(who,amount_wei,updated_at_s) VALUES(?,?,?) ON CONFLICT(who) DO UPDATE SET amount_wei=excluded.amount_wei, updated_at_s=excluded.updated_at_s",
+                (who, nxt, ts),
+            )
+
+    def credit_sub(self, who: str, delta_wei: int) -> None:
+        ts = utc_now_s()
+        with self.tx() as db:
+            row = db.execute("SELECT amount_wei FROM credits WHERE who=?", (who,)).fetchone()
+            cur = int(row["amount_wei"]) if row else 0
+            nxt = safe_sub_u256(cur, int(delta_wei), what="credit_sub")
+            db.execute(
+                "INSERT INTO credits(who,amount_wei,updated_at_s) VALUES(?,?,?) ON CONFLICT(who) DO UPDATE SET amount_wei=excluded.amount_wei, updated_at_s=excluded.updated_at_s",
+                (who, nxt, ts),
+            )
+
+
+# -----------------------------
+# Domain: lanes, quotes, policy, claims
+# -----------------------------
+
+@dataclasses.dataclass(frozen=True)
+class LaneCfg:
+    lane_id: str
+    enabled: bool
+    capacity_wad: int
+    min_premium_wad: int
+    max_duration_s: int
