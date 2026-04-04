@@ -1454,3 +1454,94 @@ def serve(db_path: str, bind: str, port: int) -> None:
 
     def _sig(_signum: int, _frame: t.Any) -> None:
         stop.set()
+        with contextlib.suppress(Exception):
+            httpd.shutdown()
+
+    signal.signal(signal.SIGINT, _sig)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _sig)
+
+    print(f"{APP_NAME} listening on http://{bind}:{port}  (db={db_path})")
+    print("Try: GET /snapshot")
+    try:
+        httpd.serve_forever(poll_interval=0.25)
+    finally:
+        with contextlib.suppress(Exception):
+            httpd.server_close()
+        store.close()
+
+
+# -----------------------------
+# CLI utilities
+# -----------------------------
+
+def http_request(method: str, url: str, body: dict | None = None, *, timeout_s: float = 10.0) -> dict:
+    import urllib.request
+
+    data = None
+    headers = {}
+    if body is not None:
+        raw = stable_json(body)
+        data = raw
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {"raw": raw.decode("utf-8", errors="replace")}
+
+
+def demo_flow(base_url: str) -> None:
+    base = base_url.rstrip("/")
+    print("Health:")
+    print(json.dumps(http_request("GET", base + "/health"), indent=2))
+
+    print("\nConfigure lane:")
+    lane = http_request(
+        "POST",
+        base + "/lanes/configure",
+        {
+            "enabled": True,
+            "capacity_wad": secrets.randbelow(900_000_000) + 350_000,
+            "min_premium_wad": secrets.randbelow(3_800_000) + 12_345,
+            "max_duration_s": secrets.randbelow(60 * 24 * 60 * 60) + 3 * 24 * 60 * 60,
+            "deductible_bps": secrets.randbelow(1_200),
+            "grace_bps": secrets.randbelow(450),
+        },
+    )
+    print(json.dumps(lane, indent=2))
+    lane_id = lane["lane"]["lane_id"]
+
+    print("\nDeposit pool capital:")
+    dep = http_request("POST", base + "/pool/deposit", {"amount_wei": to_wei_eth(25.0), "memo": "bootstrap liquidity"})
+    print(json.dumps(dep, indent=2))
+
+    print("\nOpen quote:")
+    buyer = "0x" + secrets.token_hex(20)
+    start = utc_now_s() + 90
+    end = start + (secrets.randbelow(7 * 24 * 60 * 60) + 6 * 60 * 60)
+    q = http_request(
+        "POST",
+        base + "/quotes/open",
+        {"buyer": buyer, "lane_id": lane_id, "cover_eth": 1.75, "start_at_s": start, "end_at_s": end},
+    )
+    print(json.dumps(q, indent=2))
+    quote_id = q["quote"]["quote_id"]
+    paid = q["pricing"]["required_wei"]
+
+    print("\nBind policy:")
+    p = http_request("POST", base + "/policies/bind", {"quote_id": quote_id, "payer": buyer, "paid_wei": paid, "memo": "demo bind"})
+    print(json.dumps(p, indent=2))
+    policy_id = p["policy"]["policy_id"]
+
+    print("\nFile claim:")
+    c = http_request("POST", base + "/claims/file", {"policy_id": policy_id, "holder": buyer, "loss_ref": "loss:" + secrets.token_hex(10)})
+    print(json.dumps(c, indent=2))
+    claim_id = c["claim"]["claim_id"]
+
+    print("\nAttest claim:")
+    a = http_request("POST", base + "/claims/attest", {"claim_id": claim_id, "payout_wei": to_wei_eth(0.4)})
+    print(json.dumps(a, indent=2))
+
