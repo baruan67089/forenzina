@@ -908,3 +908,94 @@ class Engine:
             min_premium_wad=int(lane["min_premium_wad"]),
             reserve_factor_bps=self._m_int("reserve_factor_bps"),
         )
+        fee_bps = self._m_int("protocol_fee_bps")
+        fee_wei = bps_mul(premium_wei, fee_bps)
+        required_wei = premium_wei + fee_wei
+
+        q = {
+            "quote_id": quote_id,
+            "buyer": buyer,
+            "lane_id": lane_id,
+            "cover_wei": int(cover_wei),
+            "start_at_s": int(start_at_s),
+            "end_at_s": int(end_at_s),
+            "created_at_s": int(created_at),
+            "expires_at_s": int(expires_at),
+            "salt": int(salt),
+            "consumed": False,
+        }
+        self.s.quote_put(q)
+        self.s.ledger_add(kind="quote_open", ref=quote_id, amount_wei=0, memo="quote opened")
+
+        return {
+            "quote": q,
+            "pricing": {
+                "premium_wei": premium_wei,
+                "fee_wei": fee_wei,
+                "required_wei": required_wei,
+                "reserve_wei": reserve_wei,
+                "protocol_fee_bps": fee_bps,
+            },
+        }
+
+    def policy_bind(self, *, quote_id: str, payer: str, paid_wei: int, memo: str = "") -> dict:
+        ensure_hex(quote_id, what="quote_id")
+        ensure_hex(payer, what="payer")
+        paid_wei = clamp_int(int(paid_wei), 0, 10**40, what="paid_wei")
+
+        q = self.s.quote_get(quote_id)
+        if int(q["consumed"]) == 1:
+            raise Conflict("quote consumed", details={"quote_id": quote_id})
+        if str(q["buyer"]).lower() != payer.lower():
+            raise Unauthorized("payer must match quote buyer")
+        now_s = utc_now_s()
+        if now_s > int(q["expires_at_s"]):
+            raise TooLate("quote expired", details={"expires_at_s": int(q["expires_at_s"]), "now_s": now_s})
+
+        lane = self.s.lane_get(str(q["lane_id"]))
+        if int(lane["enabled"]) != 1:
+            raise NotFound("lane disabled", details={"lane_id": str(q["lane_id"])})
+
+        term = int(q["end_at_s"]) - int(q["start_at_s"])
+        grace = grace_seconds(int(lane["grace_bps"]), term)
+        if now_s > int(q["start_at_s"]) + grace:
+            raise TooLate("start window passed", details={"start_at_s": int(q["start_at_s"]), "grace_s": grace, "now_s": now_s})
+
+        premium_wei, reserve_wei = price_quote(
+            int(q["cover_wei"]),
+            int(q["start_at_s"]),
+            int(q["end_at_s"]),
+            min_premium_wad=int(lane["min_premium_wad"]),
+            reserve_factor_bps=self._m_int("reserve_factor_bps"),
+        )
+        fee_wei = bps_mul(premium_wei, self._m_int("protocol_fee_bps"))
+        required_wei = premium_wei + fee_wei
+        if paid_wei != required_wei:
+            raise BadInput("paid_wei must equal required_wei", details={"paid_wei": paid_wei, "required_wei": required_wei})
+
+        used_wad = int(lane["used_wad"])
+        cap_wad = int(lane["capacity_wad"])
+        cover_wad = cover_to_wad(int(q["cover_wei"]))
+        if used_wad + cover_wad > cap_wad:
+            raise Accounting("lane capacity exceeded", details={"used_wad": used_wad, "cover_wad": cover_wad, "capacity_wad": cap_wad})
+
+        avail = self._m_int("available_capital_wei")
+        if avail < reserve_wei:
+            raise Accounting("pool insufficient to reserve", details={"available": avail, "reserve": reserve_wei})
+
+        # accounting updates
+        avail = safe_add_u256(avail, int(premium_wei), what="available+premium")
+        reserved = self._m_int("reserved_capital_wei")
+        reserved = safe_add_u256(reserved, int(reserve_wei), what="reserved+reserve")
+
+        self.s.meta_set("available_capital_wei", str(avail))
+        self.s.meta_set("reserved_capital_wei", str(reserved))
+        self.s.meta_set("total_premiums_wei", str(safe_add_u256(self._m_int("total_premiums_wei"), int(premium_wei), what="premiums+")))
+
+        # treasury gets fee as credit
+        treasury = self._m_str("treasury")
+        self.s.credit_add(treasury, int(fee_wei))
+
+        # bump lane used
+        with self.s.tx() as db:
+            db.execute("UPDATE lanes SET used_wad = used_wad + ? , updated_at_s=? WHERE lane_id=?", (int(cover_wad), utc_now_s(), str(q["lane_id"])))
