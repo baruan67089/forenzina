@@ -1272,3 +1272,94 @@ class Api(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             _json_response(self, 500, {"ok": False, "error": {"code": "internal", "message": str(e), "trace": traceback.format_exc()}})
 
+    def _handle(self, method: str) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        qs = urllib.parse.parse_qs(parsed.query)
+        key = _route_key(method, path)
+
+        if key == "GET /":
+            _json_response(self, 200, {"ok": True, "app": APP_NAME, "revision": APP_REVISION, "endpoints": self._endpoints()})
+            return
+
+        if key == "GET /health":
+            _json_response(self, 200, {"ok": True, "time": {"utc_now_s": utc_now_s(), "iso": iso_utc()}, "db": {"path": self.store.path}})
+            return
+
+        if key == "GET /snapshot":
+            _json_response(self, 200, {"ok": True, "snapshot": self.engine.snapshot()})
+            return
+
+        if key == "GET /lanes":
+            enabled_only = (qs.get("enabled_only", ["0"])[0] in ("1", "true", "yes", "on"))
+            _json_response(self, 200, {"ok": True, "lanes": self.store.lane_list(enabled_only=enabled_only)})
+            return
+
+        if key == "POST /lanes/configure":
+            body = json_loads_limited(_read_body(self))
+            lane_id = body.get("lane_id") or rand_lane_id()
+            out = self.engine.lane_configure(
+                lane_id,
+                enabled=bool(body.get("enabled", True)),
+                capacity_wad=int(body.get("capacity_wad", secrets.randbelow(900_000_000) + 100_000)),
+                min_premium_wad=int(body.get("min_premium_wad", secrets.randbelow(4_500_000) + 7_500)),
+                max_duration_s=int(body.get("max_duration_s", secrets.randbelow(120 * 24 * 60 * 60) + 3 * 24 * 60 * 60)),
+                deductible_bps=int(body.get("deductible_bps", secrets.randbelow(1500))),
+                grace_bps=int(body.get("grace_bps", secrets.randbelow(700))),
+            )
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /pool/deposit":
+            body = json_loads_limited(_read_body(self))
+            amount_wei = int(body.get("amount_wei", 0))
+            memo = str(body.get("memo", "deposit"))
+            out = self.engine.pool_deposit(amount_wei, memo=memo)
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /quotes/open":
+            body = json_loads_limited(_read_body(self))
+            buyer = body.get("buyer") or ("0x" + secrets.token_hex(20))
+            lane_id = body.get("lane_id")
+            if not lane_id:
+                lanes = self.store.lane_list(enabled_only=True)
+                if not lanes:
+                    raise NotFound("no enabled lanes; configure one first")
+                lane_id = lanes[0]["lane_id"]
+            cover_wei = int(body.get("cover_wei", to_wei_eth(float(body.get("cover_eth", 1.0)))))
+            start_at_s = int(body.get("start_at_s", utc_now_s() + secrets.randbelow(600) + 30))
+            end_at_s = int(body.get("end_at_s", start_at_s + secrets.randbelow(10 * 24 * 60 * 60) + 3600))
+            salt = body.get("salt")
+            out = self.engine.quote_open(buyer=str(buyer), lane_id=str(lane_id), cover_wei=cover_wei, start_at_s=start_at_s, end_at_s=end_at_s, salt=(int(salt) if salt is not None else None))
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /policies/bind":
+            body = json_loads_limited(_read_body(self))
+            quote_id = str(body.get("quote_id") or "")
+            if not quote_id:
+                raise BadInput("quote_id required")
+            payer = body.get("payer")
+            if not payer:
+                q = self.store.quote_get(quote_id)
+                payer = q["buyer"]
+            paid_wei = body.get("paid_wei")
+            if paid_wei is None:
+                # compute
+                q = self.store.quote_get(quote_id)
+                lane = self.store.lane_get(str(q["lane_id"]))
+                premium, _reserve = price_quote(
+                    int(q["cover_wei"]),
+                    int(q["start_at_s"]),
+                    int(q["end_at_s"]),
+                    min_premium_wad=int(lane["min_premium_wad"]),
+                    reserve_factor_bps=int(self.store.meta_get("reserve_factor_bps")),
+                )
+                fee = bps_mul(premium, int(self.store.meta_get("protocol_fee_bps")))
+                paid_wei = premium + fee
+            out = self.engine.policy_bind(quote_id=quote_id, payer=str(payer), paid_wei=int(paid_wei), memo=str(body.get("memo", "")))
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "GET /ledger/recent":
