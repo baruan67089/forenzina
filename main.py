@@ -1545,3 +1545,84 @@ def demo_flow(base_url: str) -> None:
     a = http_request("POST", base + "/claims/attest", {"claim_id": claim_id, "payout_wei": to_wei_eth(0.4)})
     print(json.dumps(a, indent=2))
 
+    print("\nPay claim:")
+    pay = http_request("POST", base + "/claims/pay", {"claim_id": claim_id, "to": buyer})
+    print(json.dumps(pay, indent=2))
+
+    print("\nWithdraw credit (simulated):")
+    wd = http_request("POST", base + "/credits/withdraw", {"who": buyer, "amount_wei": to_wei_eth(0.4)})
+    print(json.dumps(wd, indent=2))
+
+    print("\nSnapshot:")
+    snap = http_request("GET", base + "/snapshot")
+    print(json.dumps(snap, indent=2))
+
+    print("\nRecent ledger:")
+    led = http_request("GET", base + "/ledger/recent?limit=50")
+    print(json.dumps(led, indent=2))
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("serve", help="run local HTTP API")
+    sp.add_argument("--db", default=DEFAULT_DB_PATH)
+    sp.add_argument("--bind", default=DEFAULT_BIND)
+    sp.add_argument("--port", type=int, default=DEFAULT_PORT)
+
+    dp = sub.add_parser("demo", help="run a demo flow against a running server")
+    dp.add_argument("--url", default=f"http://{DEFAULT_BIND}:{DEFAULT_PORT}")
+
+    ip = sub.add_parser("init", help="initialize DB + seed a few lanes")
+    ip.add_argument("--db", default=DEFAULT_DB_PATH)
+    ip.add_argument("--lanes", type=int, default=4)
+
+    sp2 = sub.add_parser("snapshot", help="print DB snapshot (no server needed)")
+    sp2.add_argument("--db", default=DEFAULT_DB_PATH)
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "serve":
+        serve(args.db, args.bind, int(args.port))
+        return 0
+
+    if args.cmd == "demo":
+        demo_flow(args.url)
+        return 0
+
+    if args.cmd == "snapshot":
+        st = Store(args.db)
+        try:
+            eng = Engine(st)
+            print(json.dumps(eng.snapshot(), indent=2))
+        finally:
+            st.close()
+        return 0
+
+    if args.cmd == "init":
+        st = Store(args.db)
+        try:
+            eng = Engine(st)
+            # seed lanes with randomized (but bounded) parameters
+            for _ in range(int(args.lanes)):
+                lane_id = rand_lane_id()
+                eng.lane_configure(
+                    lane_id,
+                    enabled=True,
+                    capacity_wad=secrets.randbelow(900_000_000) + 120_000,
+                    min_premium_wad=secrets.randbelow(5_000_000) + 8_000,
+                    max_duration_s=secrets.randbelow(200 * 24 * 60 * 60) + 2 * 24 * 60 * 60,
+                    deductible_bps=secrets.randbelow(2_200),
+                    grace_bps=secrets.randbelow(650),
+                )
+            print(json.dumps(eng.snapshot(), indent=2))
+        finally:
+            st.close()
+        return 0
+
+    raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
