@@ -999,3 +999,94 @@ class Engine:
         # bump lane used
         with self.s.tx() as db:
             db.execute("UPDATE lanes SET used_wad = used_wad + ? , updated_at_s=? WHERE lane_id=?", (int(cover_wad), utc_now_s(), str(q["lane_id"])))
+
+        self.s.quote_mark_consumed(quote_id)
+
+        policy_id = policy_id_for(
+            quote_id,
+            payer,
+            str(q["lane_id"]),
+            int(q["cover_wei"]),
+            int(q["start_at_s"]),
+            int(q["end_at_s"]),
+            int(premium_wei),
+        )
+        with contextlib.suppress(NotFound):
+            _ = self.s.policy_get(policy_id)
+            raise Conflict("policy already exists", details={"policy_id": policy_id})
+
+        p = {
+            "policy_id": policy_id,
+            "quote_id": quote_id,
+            "holder": payer,
+            "lane_id": str(q["lane_id"]),
+            "cover_wei": int(q["cover_wei"]),
+            "premium_wei": int(premium_wei),
+            "fee_wei": int(fee_wei),
+            "start_at_s": int(q["start_at_s"]),
+            "end_at_s": int(q["end_at_s"]),
+            "bound_at_s": int(now_s),
+            "state": "Active",
+            "nonce": 1,
+        }
+        self.s.policy_put(p)
+        self.s.ledger_add(kind="policy_bind", ref=policy_id, amount_wei=int(premium_wei), memo=memo or "policy bound")
+        return {"policy": p, "pool": {"available_capital_wei": avail, "reserved_capital_wei": reserved}}
+
+    def claim_file(self, *, policy_id: str, holder: str, loss_ref: str) -> dict:
+        ensure_hex(policy_id, what="policy_id")
+        ensure_hex(holder, what="holder")
+        if not isinstance(loss_ref, str) or len(loss_ref) < 3:
+            raise BadInput("loss_ref too short")
+        # store loss_ref as hash-like reference string (not necessarily hex)
+        p = self.s.policy_get(policy_id)
+        if str(p["holder"]).lower() != holder.lower():
+            raise Unauthorized("holder mismatch")
+        if str(p["state"]) != "Active":
+            raise BadInput("policy not active", details={"state": str(p["state"])})
+        now_s = utc_now_s()
+        if now_s < int(p["start_at_s"]):
+            raise TooSoon("policy not started", details={"start_at_s": int(p["start_at_s"]), "now_s": now_s})
+        if now_s > int(p["end_at_s"]):
+            raise TooLate("policy ended", details={"end_at_s": int(p["end_at_s"]), "now_s": now_s})
+
+        nonce = int(p["nonce"])
+        claim_id = claim_id_for(policy_id, holder, loss_ref, nonce)
+        with contextlib.suppress(NotFound):
+            _ = self.s.claim_get(claim_id)
+            raise Conflict("claim exists", details={"claim_id": claim_id})
+
+        c = {
+            "claim_id": claim_id,
+            "policy_id": policy_id,
+            "holder": holder,
+            "loss_ref": loss_ref,
+            "filed_at_s": int(now_s),
+            "state": "Filed",
+            "payout_wei": 0,
+            "verdict_hash": "0x" + "00" * 32,
+            "attested_at_s": 0,
+            "paid_at_s": 0,
+            "void_reason": "",
+        }
+        self.s.claim_put(c)
+        self.s.policy_update_state(policy_id, "Claimed", bump_nonce=True)
+        self.s.ledger_add(kind="claim_file", ref=claim_id, amount_wei=0, memo="claim filed")
+        return {"claim": c}
+
+    def _max_net_payout(self, policy_row: sqlite3.Row, lane_row: sqlite3.Row) -> int:
+        cover = int(policy_row["cover_wei"])
+        deductible_bps = int(lane_row["deductible_bps"])
+        if deductible_bps < 0:
+            deductible_bps = 0
+        if deductible_bps > 6_600:
+            deductible_bps = 6_600
+        return (cover * (BPS - deductible_bps)) // BPS
+
+    def claim_attest(self, *, claim_id: str, payout_wei: int, verdict_hash: str | None = None, deadline_s: int | None = None) -> dict:
+        ensure_hex(claim_id, what="claim_id")
+        payout_wei = clamp_int(int(payout_wei), 0, 10**40, what="payout_wei")
+        c = self.s.claim_get(claim_id)
+        if str(c["state"]) != "Filed":
+            raise BadInput("claim not filed", details={"state": str(c["state"])})
+
