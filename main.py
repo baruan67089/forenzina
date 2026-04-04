@@ -1363,3 +1363,94 @@ class Api(http.server.BaseHTTPRequestHandler):
             return
 
         if key == "GET /ledger/recent":
+            limit = int(qs.get("limit", ["100"])[0])
+            _json_response(self, 200, {"ok": True, "entries": self.store.ledger_recent(limit=limit)})
+            return
+
+        if key == "POST /claims/file":
+            body = json_loads_limited(_read_body(self))
+            policy_id = str(body.get("policy_id") or "")
+            if not policy_id:
+                raise BadInput("policy_id required")
+            holder = body.get("holder")
+            if not holder:
+                p = self.store.policy_get(policy_id)
+                holder = p["holder"]
+            loss_ref = str(body.get("loss_ref") or ("loss:" + secrets.token_hex(16)))
+            out = self.engine.claim_file(policy_id=policy_id, holder=str(holder), loss_ref=loss_ref)
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /claims/attest":
+            body = json_loads_limited(_read_body(self))
+            claim_id = str(body.get("claim_id") or "")
+            if not claim_id:
+                raise BadInput("claim_id required")
+            payout_wei = int(body.get("payout_wei", 0))
+            verdict_hash = body.get("verdict_hash")
+            deadline_s = body.get("deadline_s")
+            out = self.engine.claim_attest(
+                claim_id=claim_id,
+                payout_wei=payout_wei,
+                verdict_hash=(str(verdict_hash) if verdict_hash is not None else None),
+                deadline_s=(int(deadline_s) if deadline_s is not None else None),
+            )
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /claims/pay":
+            body = json_loads_limited(_read_body(self))
+            claim_id = str(body.get("claim_id") or "")
+            if not claim_id:
+                raise BadInput("claim_id required")
+            to = str(body.get("to") or ("0x" + secrets.token_hex(20)))
+            out = self.engine.claim_pay(claim_id=claim_id, to=to)
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        if key == "POST /credits/withdraw":
+            body = json_loads_limited(_read_body(self))
+            who = str(body.get("who") or "")
+            if not who:
+                raise BadInput("who required")
+            amount_wei = int(body.get("amount_wei", 0))
+            out = self.engine.credit_withdraw(who=who, amount_wei=amount_wei)
+            _json_response(self, 200, {"ok": True, **out})
+            return
+
+        _json_response(self, 404, {"ok": False, "error": {"code": "not_found", "message": "endpoint not found", "details": {"method": method, "path": path}}})
+
+    def _endpoints(self) -> list[str]:
+        return [
+            "GET /",
+            "GET /health",
+            "GET /snapshot",
+            "GET /lanes?enabled_only=1",
+            "POST /lanes/configure",
+            "POST /pool/deposit",
+            "POST /quotes/open",
+            "POST /policies/bind",
+            "POST /claims/file",
+            "POST /claims/attest",
+            "POST /claims/pay",
+            "POST /credits/withdraw",
+            "GET /ledger/recent?limit=100",
+        ]
+
+
+def serve(db_path: str, bind: str, port: int) -> None:
+    store = Store(db_path)
+    engine = Engine(store)
+
+    class _Handler(Api):
+        pass
+
+    _Handler.store = store
+    _Handler.engine = engine
+
+    httpd = http.server.ThreadingHTTPServer((bind, int(port)), _Handler)
+
+    stop = threading.Event()
+
+    def _sig(_signum: int, _frame: t.Any) -> None:
+        stop.set()
