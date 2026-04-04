@@ -1090,3 +1090,94 @@ class Engine:
         if str(c["state"]) != "Filed":
             raise BadInput("claim not filed", details={"state": str(c["state"])})
 
+        p = self.s.policy_get(str(c["policy_id"]))
+        if str(p["state"]) != "Claimed":
+            raise BadInput("policy not claimed", details={"state": str(p["state"])})
+        lane = self.s.lane_get(str(p["lane_id"]))
+        if int(lane["enabled"]) != 1:
+            raise NotFound("lane disabled")
+
+        max_net = self._max_net_payout(p, lane)
+        if payout_wei > max_net:
+            raise BadInput("payout exceeds deductible-adjusted max", details={"payout_wei": payout_wei, "max_net": max_net})
+
+        if verdict_hash is None:
+            verdict_hash = h256(stable_json({"verdict": "ok", "at_ms": now_ms(), "salt": secrets.token_hex(16)}))
+        ensure_hex(verdict_hash, what="verdict_hash")
+
+        now_s = utc_now_s()
+        if deadline_s is None:
+            deadline_s = now_s + 10 * 60 + 11
+        deadline_s = clamp_int(int(deadline_s), now_s + 1, now_s + 7 * 24 * 60 * 60, what="deadline_s")
+
+        domain_tag = self.s.meta_get("genesis_tag")
+        nonce = int(self.s.oracle_get("nonce"))
+        digest = oracle_digest_for(
+            claim_id,
+            str(c["policy_id"]),
+            payout_wei,
+            verdict_hash,
+            now_s,
+            nonce,
+            deadline_s,
+            domain_tag=domain_tag,
+        )
+        key = b64u_decode(self.s.oracle_get("hmac_key_b64u"))
+        signature = oracle_sign_hmac(digest, hmac_key=key)
+
+        # persist attestation
+        self.s.claim_update(claim_id, state="Attested", payout_wei=int(payout_wei), verdict_hash=verdict_hash, attested_at_s=now_s)
+        self.s.oracle_set("nonce", str(nonce + 1))
+        self.s.ledger_add(kind="claim_attest", ref=claim_id, amount_wei=int(payout_wei), memo="claim attested")
+
+        return {
+            "attestation": {
+                "claim_id": claim_id,
+                "policy_id": str(c["policy_id"]),
+                "payout_wei": int(payout_wei),
+                "verdict_hash": verdict_hash,
+                "attested_at_s": int(now_s),
+                "nonce": int(nonce),
+                "deadline_s": int(deadline_s),
+                "digest": "0x" + digest.hex(),
+                "signature": signature,
+                "oracle": self._m_str("oracle"),
+            }
+        }
+
+    def claim_pay(self, *, claim_id: str, to: str) -> dict:
+        ensure_hex(claim_id, what="claim_id")
+        ensure_hex(to, what="to")
+        c = self.s.claim_get(claim_id)
+        if str(c["state"]) != "Attested":
+            raise BadInput("claim not attested", details={"state": str(c["state"])})
+        p = self.s.policy_get(str(c["policy_id"]))
+        if str(p["state"]) != "Claimed":
+            raise BadInput("policy not claimed", details={"state": str(p["state"])})
+
+        payout = int(c["payout_wei"])
+        avail = self._m_int("available_capital_wei")
+        if avail < payout:
+            raise Accounting("insufficient available capital", details={"available": avail, "payout": payout})
+
+        # release reserve
+        reserve_factor = self._m_int("reserve_factor_bps")
+        reserve = (int(p["cover_wei"]) * reserve_factor) // BPS
+        reserved = self._m_int("reserved_capital_wei")
+        if reserved < reserve:
+            raise Accounting("reserved underflow", details={"reserved": reserved, "reserve": reserve})
+        reserved = safe_sub_u256(reserved, reserve, what="reserved-reserve")
+
+        # decrement lane used
+        lane = self.s.lane_get(str(p["lane_id"]))
+        cover_wad = cover_to_wad(int(p["cover_wei"]))
+        used = int(lane["used_wad"])
+        if used < cover_wad:
+            raise Accounting("used underflow", details={"used": used, "cover_wad": cover_wad})
+        with self.s.tx() as db:
+            db.execute("UPDATE lanes SET used_wad=used_wad-?, updated_at_s=? WHERE lane_id=?", (int(cover_wad), utc_now_s(), str(p["lane_id"])))
+
+        avail = safe_sub_u256(avail, payout, what="available-payout")
+        self.s.meta_set("available_capital_wei", str(avail))
+        self.s.meta_set("reserved_capital_wei", str(reserved))
+        self.s.meta_set("total_claims_paid_wei", str(safe_add_u256(self._m_int("total_claims_paid_wei"), payout, what="claimsPaid+")))
