@@ -1181,3 +1181,94 @@ class Engine:
         self.s.meta_set("available_capital_wei", str(avail))
         self.s.meta_set("reserved_capital_wei", str(reserved))
         self.s.meta_set("total_claims_paid_wei", str(safe_add_u256(self._m_int("total_claims_paid_wei"), payout, what="claimsPaid+")))
+
+        # credit receiver (pull-payment)
+        self.s.credit_add(to, payout)
+
+        now_s = utc_now_s()
+        self.s.claim_update(claim_id, state="Paid", paid_at_s=now_s)
+        self.s.policy_update_state(str(c["policy_id"]), "Settled", bump_nonce=True)
+        self.s.ledger_add(kind="claim_pay", ref=claim_id, amount_wei=payout, memo="claim paid to credit")
+
+        return {"ok": True, "credited_to": to, "amount_wei": payout, "pool": {"available_capital_wei": avail, "reserved_capital_wei": reserved}}
+
+    def credit_withdraw(self, *, who: str, amount_wei: int) -> dict:
+        ensure_hex(who, what="who")
+        amount_wei = clamp_int(int(amount_wei), 1, 10**40, what="amount_wei")
+        cur = self.s.credit_get(who)
+        if cur < amount_wei:
+            raise Accounting("insufficient credit", details={"credit": cur, "amount_wei": amount_wei})
+        self.s.credit_sub(who, amount_wei)
+        self.s.ledger_add(kind="credit_withdraw", ref=who, amount_wei=int(amount_wei), memo="credit withdrawn (simulated)")
+        return {"ok": True, "who": who, "withdrawn_wei": int(amount_wei), "remaining_credit_wei": self.s.credit_get(who)}
+
+
+# -----------------------------
+# HTTP server
+# -----------------------------
+
+def _json_response(handler: http.server.BaseHTTPRequestHandler, status: int, obj: t.Any, *, headers: dict[str, str] | None = None) -> None:
+    raw = stable_json(obj)
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.send_header("X-App-Name", APP_NAME)
+    handler.send_header("X-App-Revision", str(APP_REVISION))
+    handler.send_header("X-Server-Time", iso_utc())
+    if headers:
+        for k, v in headers.items():
+            handler.send_header(k, v)
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+def _err(handler: http.server.BaseHTTPRequestHandler, status: int, e: ForenzinaError) -> None:
+    _json_response(handler, status, {"ok": False, "error": {"code": e.code, "message": e.message, "details": e.details}})
+
+
+def _read_body(handler: http.server.BaseHTTPRequestHandler) -> bytes:
+    length = handler.headers.get("Content-Length")
+    if length is None:
+        return b""
+    try:
+        n = int(length)
+    except Exception as e:
+        raise BadInput("invalid content-length") from e
+    if n < 0 or n > MAX_BODY_BYTES:
+        raise BadInput("content-length out of range")
+    return handler.rfile.read(n)
+
+
+def _route_key(method: str, path: str) -> str:
+    return method.upper().strip() + " " + path
+
+
+class Api(http.server.BaseHTTPRequestHandler):
+    server_version = "forenzina/0"
+    protocol_version = "HTTP/1.1"
+
+    # injected
+    engine: Engine
+    store: Store
+
+    def log_message(self, fmt: str, *args: t.Any) -> None:
+        # quiet by default; enable by setting FORENZINA_LOG=1
+        if os.environ.get("FORENZINA_LOG", "").strip() in ("1", "true", "yes", "on"):
+            super().log_message(fmt, *args)
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._handle("GET")
+        except ForenzinaError as e:
+            _err(self, 400, e)
+        except Exception as e:
+            _json_response(self, 500, {"ok": False, "error": {"code": "internal", "message": str(e), "trace": traceback.format_exc()}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._handle("POST")
+        except ForenzinaError as e:
+            _err(self, 400, e)
+        except Exception as e:
+            _json_response(self, 500, {"ok": False, "error": {"code": "internal", "message": str(e), "trace": traceback.format_exc()}})
+
